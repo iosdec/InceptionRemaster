@@ -1,0 +1,14 @@
+// Somnia — local signing configuration
+//
+// Copy this file to `Local.xcconfig` (which is git-ignored) and fill in your own
+// values. Nothing here is committed, so your Apple identity stays on your machine.
+
+// Your Apple Developer Team ID (Xcode ▸ Settings ▸ Accounts, or the developer
+// portal). Leave blank to sign to run only in the Simulator.
+DEVELOPMENT_TEAM =
+
+// A bundle identifier you control. Must be unique to your account.
+PRODUCT_BUNDLE_IDENTIFIER = com.example.somnia
+
+// Automatic signing is simplest for local builds.
+CODE_SIGN_STYLE = Automatic
