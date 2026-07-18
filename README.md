@@ -73,6 +73,22 @@ git-ignored and never committed.
 Requirements: Xcode 26+, iOS 26+ device (Simulator works, but sensors, the mic
 voice effect, and background audio need real hardware).
 
+### WeatherKit (optional)
+
+The Sunshine dream uses WeatherKit to know if it's clear and sunny. WeatherKit
+needs a **paid** Apple Developer account and the **WeatherKit capability enabled
+on your App ID** — it's tied to the exact bundle identifier you build with:
+
+1. At [developer.apple.com](https://developer.apple.com/account/resources/identifiers/list),
+   open (or create) the App ID matching your `PRODUCT_BUNDLE_IDENTIFIER` and
+   enable **WeatherKit**.
+2. Allow up to ~30 minutes for Apple's servers to propagate, then let Xcode
+   regenerate your provisioning profile and rebuild.
+
+Without it you'll see a one-line "WeatherKit unavailable" log and the app carries
+on as normal — only weather-driven dreams (Sunshine) won't trigger. Everything
+else works.
+
 ---
 
 ## License
