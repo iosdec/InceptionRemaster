@@ -28,7 +28,7 @@ struct ImportView: View {
                     step(
                         number: 1,
                         title: "Import the app package",
-                        detail: "Somnia ships with no artwork or audio. Choose your own copy of the original app package (.ipa) and Somnia extracts what it needs — on your device, nothing uploaded.",
+                        detail: "Somnia ships with no content. Choose your own copy of the original app package (.ipa) and Somnia extracts everything it needs — artwork, sounds, and all the dream scenes — on your device, nothing uploaded.",
                         done: artImported,
                         buttonTitle: artImported ? "Re-import package" : "Choose .ipa…",
                         action: { showPackagePicker = true }
@@ -36,10 +36,10 @@ struct ImportView: View {
 
                     step(
                         number: 2,
-                        title: "Add your scenes",
-                        detail: "Dream scenes are RjDj-format .rjz bundles. Add the ones you own — you can add more any time.",
+                        title: "Extra scenes (optional)",
+                        detail: "Scenes come straight from your package. If you have additional RjDj-format .rjz bundles, you can add them here too.",
                         done: scenesImported,
-                        buttonTitle: scenesImported ? "Add more scenes" : "Choose .rjz files…",
+                        buttonTitle: "Add .rjz files…",
                         action: { showScenePicker = true }
                     )
 
@@ -79,6 +79,7 @@ struct ImportView: View {
                     await importer.importAppPackage(from: url)
                     AssetStore.shared.clearCache()
                     artImported = AssetStore.shared.isImported
+                    scenesImported = Self.hasScenes   // scenes come in with the package now
                 }
             }
         }
@@ -121,8 +122,8 @@ struct ImportView: View {
             Label(msg, systemImage: "exclamationmark.triangle")
                 .font(.system(size: 11, weight: .light))
                 .foregroundStyle(.red.opacity(0.7))
-        case .done(let assets, let sounds):
-            Label("Imported \(assets) images and \(sounds) sounds.", systemImage: "checkmark.circle")
+        case .done(let assets, let sounds, let scenes):
+            Label("Imported \(assets) images, \(sounds) sounds, and \(scenes) scenes.", systemImage: "checkmark.circle")
                 .font(.system(size: 11, weight: .light))
                 .foregroundStyle(.green.opacity(0.6))
         case .idle:

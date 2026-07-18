@@ -16,7 +16,7 @@ public final class IPAImporter: ObservableObject {
     public enum Phase: Equatable {
         case idle
         case working(String)
-        case done(assets: Int, sounds: Int)
+        case done(assets: Int, sounds: Int, scenes: Int)
         case failed(String)
     }
 
@@ -39,8 +39,8 @@ public final class IPAImporter: ObservableObject {
             let result = try await Task.detached(priority: .userInitiated) {
                 try Self.extract(packageAt: pickedURL)
             }.value
-            phase = .done(assets: result.assets, sounds: result.sounds)
-            print("✅ Imported \(result.assets) art files, \(result.sounds) sounds")
+            phase = .done(assets: result.assets, sounds: result.sounds, scenes: result.scenes)
+            print("✅ Imported \(result.assets) art, \(result.sounds) sounds, \(result.scenes) scenes")
         } catch {
             phase = .failed(error.localizedDescription)
             print("❌ Import failed: \(error)")
@@ -48,7 +48,7 @@ public final class IPAImporter: ObservableObject {
     }
 
     /// Runs off the main actor. Returns counts of what was copied.
-    private nonisolated static func extract(packageAt url: URL) throws -> (assets: Int, sounds: Int) {
+    private nonisolated static func extract(packageAt url: URL) throws -> (assets: Int, sounds: Int, scenes: Int) {
         let fm = FileManager.default
         let temp = fm.temporaryDirectory.appendingPathComponent("somnia-import-\(UUID().uuidString)")
         defer { try? fm.removeItem(at: temp) }
@@ -64,6 +64,7 @@ public final class IPAImporter: ObservableObject {
 
         try fm.createDirectory(at: AssetStore.artDir, withIntermediateDirectories: true)
         try fm.createDirectory(at: AssetStore.soundsDir, withIntermediateDirectories: true)
+        try fm.createDirectory(at: AssetStore.scenesDir, withIntermediateDirectories: true)
 
         var assets = 0, sounds = 0
         let entries = try fm.contentsOfDirectory(at: appDir, includingPropertiesForKeys: nil)
@@ -82,8 +83,34 @@ public final class IPAImporter: ObservableObject {
             try fm.copyItem(at: file, to: dest)
         }
 
+        // Scenes ship inside the package after all: compressed .rjz bundles in
+        // rjdj_scenes/, and uncompressed .rj folders in scenes/. Pull both — no
+        // manual picking needed.
+        let scenes = copyScenes(from: appDir, using: fm)
+
         guard assets > 0 else { throw ImportError.noAssetsFound }
-        return (assets, sounds)
+        return (assets, sounds, scenes)
+    }
+
+    /// Copies every .rjz bundle and .rj folder found under the app's scene
+    /// directories into the store. Returns how many were copied.
+    private nonisolated static func copyScenes(from appDir: URL, using fm: FileManager) -> Int {
+        var copied = 0
+        for sub in ["rjdj_scenes", "scenes"] {
+            let dir = appDir.appendingPathComponent(sub, isDirectory: true)
+            guard let items = try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil) else { continue }
+            for item in items where ["rjz", "rj"].contains(item.pathExtension.lowercased()) {
+                let dest = AssetStore.scenesDir.appendingPathComponent(item.lastPathComponent)
+                try? fm.removeItem(at: dest)
+                do {
+                    try fm.copyItem(at: item, to: dest)   // copies whole .rj folders too
+                    copied += 1
+                } catch {
+                    print("⚠️ Could not copy scene \(item.lastPathComponent): \(error.localizedDescription)")
+                }
+            }
+        }
+        return copied
     }
 
     // MARK: - Scenes (.rjz)
