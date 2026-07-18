@@ -141,14 +141,28 @@ public struct DreamView: View {
                 .animation(.easeInOut(duration: 1.5), value: detector.state.isQuiet)
 
             // Tells you the mic is being fed back through the dream — the moment to
-            // speak and hear yourself transformed.
+            // speak and hear yourself transformed. The bar shows live mic level, so
+            // you can see the mic is being captured even before you trust your ears.
             if audioEngine.voiceActive {
-                Label("your voice is in the dream", systemImage: "waveform")
-                    .font(.system(size: 9, weight: .light))
-                    .foregroundStyle(.white.opacity(0.4))
-                    .tracking(1)
-                    .padding(.top, 4)
-                    .transition(.opacity)
+                VStack(spacing: 6) {
+                    Label("your voice is in the dream", systemImage: "waveform")
+                        .font(.system(size: 9, weight: .light))
+                        .foregroundStyle(.white.opacity(0.4))
+                        .tracking(1)
+
+                    GeometryReader { geo in
+                        ZStack(alignment: .leading) {
+                            Capsule().fill(.white.opacity(0.1))
+                            Capsule()
+                                .fill(.white.opacity(0.5))
+                                .frame(width: geo.size.width * CGFloat(min(1, audioEngine.micLevel * 1.5)))
+                        }
+                    }
+                    .frame(width: 120, height: 3)
+                    .animation(.linear(duration: 0.1), value: audioEngine.micLevel)
+                }
+                .padding(.top, 4)
+                .transition(.opacity)
             }
         }
         .animation(.easeInOut(duration: 0.6), value: audioEngine.voiceActive)

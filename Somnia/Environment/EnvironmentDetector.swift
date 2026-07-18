@@ -100,10 +100,13 @@ public class EnvironmentDetector: NSObject, ObservableObject {
     private let motionManager = CMMotionManager()
     private let locationManager = CLLocationManager()
     private var geocoder = CLGeocoder()
-    private let audioInput = AudioInputMonitor()
+
+    /// The audio engine owns the mic (one engine for input + output). We read the
+    /// room level and quiet/loud state from it rather than opening a second engine.
+    private let audioEngine: AudioEngine
 
     /// Room sound level, 0–1. Exposed so the UI can show a live input meter.
-    public var inputLevel: Float { audioInput.level }
+    public var inputLevel: Float { audioEngine.micLevel }
 
     #if canImport(HealthKit)
     private let healthStore = HKHealthStore()
@@ -135,7 +138,8 @@ public class EnvironmentDetector: NSObject, ObservableObject {
 
     // MARK: - Init
 
-    public override init() {
+    public init(audioEngine: AudioEngine) {
+        self.audioEngine = audioEngine
         super.init()
         locationManager.delegate = self
         locationManager.desiredAccuracy = kCLLocationAccuracyHundredMeters
@@ -157,7 +161,6 @@ public class EnvironmentDetector: NSObject, ObservableObject {
     public func stopDetection() {
         motionManager.stopDeviceMotionUpdates()
         locationManager.stopUpdatingLocation()
-        audioInput.stop()
         audioCancellable = nil
         environmentRefreshTimer?.invalidate()
         moodThrottleTimer?.invalidate()
@@ -217,11 +220,9 @@ public class EnvironmentDetector: NSObject, ObservableObject {
     // MARK: - Audio Input
 
     private func startAudioInput() {
-        Task { await audioInput.start() }
-
-        // isQuiet already has hysteresis applied in the monitor, so this only
-        // fires on real transitions rather than every buffer.
-        audioCancellable = audioInput.$isQuiet
+        // The mic is owned by the audio engine now; just observe its quiet/loud
+        // state (hysteresis already applied there) and mirror it into the mood.
+        audioCancellable = audioEngine.$isQuiet
             .removeDuplicates()
             .sink { [weak self] quiet in
                 Task { @MainActor [weak self] in
@@ -466,7 +467,7 @@ public class EnvironmentDetector: NSObject, ObservableObject {
 
         // Room sound — the signal RjDj was built on. A loud room lifts energy;
         // a silent one pulls it down, so scenes settle when you do.
-        let roomLevel = audioInput.level
+        let roomLevel = audioEngine.micLevel
         energy += roomLevel * 0.35
         if state.isQuiet { energy -= 0.1 }
 

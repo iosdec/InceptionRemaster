@@ -65,14 +65,41 @@ public class AudioEngine: ObservableObject {
     // reverb/delay, fed back into your ears. grainvoice.pd did this granularly; this
     // is the AVAudioEngine approximation. Kept on its own mixer so it can be muted
     // instantly and gated to headphones (never through the speaker → no feedback).
+    // The mic is only ever TAPPED (connecting the input node into the graph throws
+    // isInputConnToConverter on device). Tapped buffers are replayed through a
+    // player node into the effects — so the input node is never a graph connection.
+    private let voicePlayer = AVAudioPlayerNode()
     private let voicePitch  = AVAudioUnitTimePitch()
     private let voiceDelay  = AVAudioUnitDelay()
     private let voiceReverb = AVAudioUnitReverb()
     private let voiceMixer  = AVAudioMixerNode()
-    private var voiceConnected = false
     private var voiceRequested = false
+    /// Read on the audio thread (tap) to decide whether to feed the effect player.
+    private nonisolated(unsafe) var voiceCapturing = false
+
+    /// The player chain runs at a FIXED format; every tapped buffer is converted to
+    /// it. This survives route/format changes (plugging in headphones switches the
+    /// mic format — otherwise the scheduled buffers mismatch and go silent).
+    private nonisolated(unsafe) var voiceFormat: AVAudioFormat?
+    private nonisolated(unsafe) var voiceConverter: AVAudioConverter?
+    private nonisolated(unsafe) var voiceConverterInputFormat: AVAudioFormat?
 
     @Published public private(set) var voiceActive = false
+
+    // Mic input — a SINGLE engine owns the hardware input, doing both level
+    // detection (a tap) and voice augmentation (routing input → effects → output).
+    // A second AVAudioEngine can't share the active hardware input, so this replaces
+    // the old separate AudioInputMonitor.
+    @Published public private(set) var micLevel: Float = 0    // 0–1, smoothed
+    @Published public private(set) var isQuiet = true
+    public var quietThreshold: Float = 0.08
+
+    private var micAuthorized = false
+    private var inputGraphReady = false     // the whole mic path is wired
+    private var micSmoothed: Float = 0
+    private let micSmoothing: Float = 0.15
+    private let micMinDb: Float = -60
+    private let micMaxDb: Float = -10
 
     private var stemPlayers: [StemPlayer] = []
     private var fadeTimer: Timer?
@@ -89,6 +116,144 @@ public class AudioEngine: ObservableObject {
         moodCancellable = $mood
             .removeDuplicates()
             .sink { [weak self] _ in self?.updateStemVolumes() }
+
+        // Request the mic up front and wire the input path so it's ready before any
+        // scene plays. This engine owns the input for both level and voice.
+        Task { await requestMicAndPrepare() }
+    }
+
+    // MARK: - Microphone
+
+    private func requestMicAndPrepare() async {
+        micAuthorized = await AVAudioApplication.requestRecordPermission()
+        guard micAuthorized else {
+            print("⚠️ Mic permission denied — no room input or voice augmentation")
+            return
+        }
+        buildInputGraph()
+    }
+
+    /// Wires the voice effect path and taps the mic. The input node is ONLY tapped —
+    /// never connected — so it can't throw isInputConnToConverter. Tapped buffers are
+    /// replayed through voicePlayer, which IS a normal graph connection and safe.
+    ///
+    ///   mic ──tap──▶ [level] + ──▶ voicePlayer ─▶ pitch ─▶ delay ─▶ reverb ─▶ voiceMixer ─▶ out
+    ///
+    private func buildInputGraph() {
+        guard micAuthorized, !inputGraphReady else { return }
+        let input = engine.inputNode
+        let format = input.outputFormat(forBus: 0)
+        guard format.sampleRate > 0, format.channelCount > 0 else {
+            print("⚠️ No input route yet — will retry when a scene loads")
+            return
+        }
+
+        // The player chain runs at a fixed stereo format matching the engine output,
+        // independent of whatever the mic delivers. Tapped buffers are converted to
+        // it before scheduling.
+        let fixed = engine.mainMixerNode.outputFormat(forBus: 0)
+        voiceFormat = fixed
+
+        let wasPlaying = isPlaying
+        if engine.isRunning { engine.stop() }
+
+        engine.connect(voicePlayer, to: voicePitch,           format: fixed)
+        engine.connect(voicePitch,  to: voiceDelay,           format: fixed)
+        engine.connect(voiceDelay,  to: voiceReverb,          format: fixed)
+        engine.connect(voiceReverb, to: voiceMixer,           format: fixed)
+        engine.connect(voiceMixer,  to: engine.mainMixerNode, format: fixed)
+
+        // Tap the mic: RMS for level (always), and — when a voice dream is active —
+        // convert each buffer to the fixed format and replay it through the effects.
+        input.installTap(onBus: 0, bufferSize: 2048, format: format) { [weak self] buffer, _ in
+            guard let self else { return }
+            if let rms = Self.rms(of: buffer) {
+                Task { @MainActor [weak self] in self?.ingestMic(rms: rms) }
+            }
+            guard self.voiceCapturing, let out = self.convertForVoice(buffer) else { return }
+            self.voicePlayer.scheduleBuffer(out, completionHandler: nil)
+        }
+
+        voiceMixer.outputVolume = 0
+        inputGraphReady = true
+
+        try? engine.start()
+        voicePlayer.play()   // plays scheduled buffers; silent until any are queued
+        if wasPlaying { for p in stemPlayers { p.playerNode.play() } }
+        print("✅ Mic graph ready — mic \(Int(format.sampleRate))Hz \(format.channelCount)ch → voice \(Int(fixed.sampleRate))Hz \(fixed.channelCount)ch")
+        reconcileVoice()
+    }
+
+    /// Converts a tapped mic buffer to the fixed voice format (rebuilding the
+    /// converter if the mic format changed, e.g. after a route change). Runs on the
+    /// audio thread.
+    private nonisolated func convertForVoice(_ input: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
+        guard let target = voiceFormat else { return nil }
+
+        if voiceConverter == nil || voiceConverterInputFormat != input.format {
+            voiceConverter = AVAudioConverter(from: input.format, to: target)
+            voiceConverterInputFormat = input.format
+        }
+        guard let converter = voiceConverter else { return nil }
+
+        // Allow for sample-rate change (e.g. 16k mic → 48k voice).
+        let ratio = target.sampleRate / input.format.sampleRate
+        let capacity = AVAudioFrameCount(Double(input.frameLength) * ratio) + 1024
+        guard let out = AVAudioPCMBuffer(pcmFormat: target, frameCapacity: capacity) else { return nil }
+
+        var supplied = false
+        var error: NSError?
+        converter.convert(to: out, error: &error) { _, status in
+            if supplied { status.pointee = .noDataNow; return nil }
+            supplied = true
+            status.pointee = .haveData
+            return input
+        }
+        guard error == nil, out.frameLength > 0 else { return nil }
+
+        // Room voice is quiet — boost it so it's clearly present over the dream,
+        // soft-clipped so the loud bits distort into the dream rather than click.
+        if let data = out.floatChannelData {
+            let gain: Float = 6.0
+            let frames = Int(out.frameLength)
+            for ch in 0..<Int(target.channelCount) {
+                let samples = data[ch]
+                for i in 0..<frames {
+                    samples[i] = tanh(samples[i] * gain)   // saturating gain
+                }
+            }
+        }
+        return out
+    }
+
+    private nonisolated static func rms(of buffer: AVAudioPCMBuffer) -> Float? {
+        guard let channels = buffer.floatChannelData, buffer.frameLength > 0 else { return nil }
+        let frames = Int(buffer.frameLength)
+        let samples = channels[0]
+        var sum: Float = 0
+        for i in 0..<frames { sum += samples[i] * samples[i] }
+        return (sum / Float(frames)).squareRoot()
+    }
+
+    private func ingestMic(rms: Float) {
+        let normalized = normalizeMic(rms: rms)
+        micSmoothed += (normalized - micSmoothed) * micSmoothing
+        micLevel = micSmoothed
+
+        // Hysteresis so a level hovering at the threshold doesn't flap isQuiet.
+        if isQuiet, micSmoothed > quietThreshold * 1.5 {
+            isQuiet = false
+        } else if !isQuiet, micSmoothed < quietThreshold {
+            isQuiet = true
+        }
+    }
+
+    private func normalizeMic(rms: Float) -> Float {
+        guard rms > 0 else { return 0 }
+        let db = 20 * log10(rms)
+        guard db.isFinite else { return 0 }
+        let clamped = max(micMinDb, min(micMaxDb, db))
+        return (clamped - micMinDb) / (micMaxDb - micMinDb)
     }
 
     // MARK: - Audio Session
@@ -166,26 +331,29 @@ public class AudioEngine: ObservableObject {
 
         masterMixer.outputVolume = 0.85
 
-        // Voice chain: pitch → delay → reverb → voiceMixer → output. Attached now,
-        // but the mic isn't wired in until enableVoice() — connecting the input node
-        // without a live input route can fault.
+        // Voice chain: voicePlayer (replays tapped mic buffers) → pitch → delay →
+        // reverb → voiceMixer → output. Wired in buildInputGraph() once the tap
+        // format is known. The mic itself is never connected — only tapped.
+        engine.attach(voicePlayer)
         engine.attach(voicePitch)
         engine.attach(voiceDelay)
         engine.attach(voiceReverb)
         engine.attach(voiceMixer)
 
-        voicePitch.pitch = -250        // shifted down — dreamlike, uncanny
-        voiceDelay.delayTime = 0.28
-        voiceDelay.feedback = 40
-        voiceDelay.wetDryMix = 45
-        voiceDelay.lowPassCutoff = 4000
+        // Tuned so the voice is clearly present, not buried in wet effect: keep a
+        // strong dry component through the delay/reverb so you plainly hear yourself,
+        // pitched and haunted. (Was very wet, which can read as "silent".)
+        voicePitch.pitch = -200        // shifted down — dreamlike, uncanny
+        voiceDelay.delayTime = 0.30
+        voiceDelay.feedback = 35
+        voiceDelay.wetDryMix = 30
+        voiceDelay.lowPassCutoff = 5000
         voiceReverb.loadFactoryPreset(.largeHall2)
-        voiceReverb.wetDryMix = 70
+        voiceReverb.wetDryMix = 40
 
-        engine.connect(voicePitch,  to: voiceDelay,  format: nil)
-        engine.connect(voiceDelay,  to: voiceReverb, format: nil)
-        engine.connect(voiceReverb, to: voiceMixer,  format: nil)
-        engine.connect(voiceMixer,  to: out,          format: nil)
+        // The whole voice subgraph (mic → pitch → delay → reverb → voiceMixer → out)
+        // is wired in prepareInput(), once the real input format is known — nothing
+        // is connected here, so no node dangles before start().
         voiceMixer.outputVolume = 0   // silent until enabled
 
         // Route changes (unplugging headphones) must instantly kill voice feedback.
@@ -214,28 +382,23 @@ public class AudioEngine: ObservableObject {
     }
 
     private func reconcileVoice() {
-        if voiceRequested, headphonesConnected {
-            connectVoiceInput()
-            voiceMixer.outputVolume = voiceConnected ? 0.9 : 0
-            voiceActive = voiceConnected
-            if voiceConnected { print("🎙️ Voice augmentation on") }
+        // The mic path is always wired; voice is just a volume gate. Audible only in
+        // a voice dream AND on headphones — the pitched feedback must never reach the
+        // speaker.
+        if voiceRequested, inputGraphReady, headphonesConnected {
+            voiceCapturing = true            // tap starts feeding the effect player
+            voiceMixer.outputVolume = 1.0
+            masterMixer.outputVolume = 0.5   // duck the dream so the voice cuts through
+            voiceActive = true
+            print("🎙️ Voice augmentation on")
         } else {
+            voiceCapturing = false
             voiceMixer.outputVolume = 0
+            masterMixer.outputVolume = 0.85  // restore the dream
             voiceActive = false
-            if voiceRequested { print("🎧 Voice augmentation needs headphones") }
+            if voiceRequested && !headphonesConnected { print("🎧 Voice augmentation needs headphones") }
+            if voiceRequested && !inputGraphReady { print("🎙️ Mic graph not ready yet") }
         }
-    }
-
-    private func connectVoiceInput() {
-        guard !voiceConnected, engine.isRunning else {
-            // If the engine isn't running yet, defer — enableVoice is retried on play().
-            return
-        }
-        let input = engine.inputNode
-        let format = input.inputFormat(forBus: 0)
-        guard format.sampleRate > 0 else { return }   // no live input route
-        engine.connect(input, to: voicePitch, format: format)
-        voiceConnected = true
     }
 
     @objc private func handleRouteChange(_ note: Notification) {
@@ -261,6 +424,10 @@ public class AudioEngine: ObservableObject {
             engine.detach(p.pitchNode)
         }
         stemPlayers.removeAll()
+
+        // If the mic graph wasn't wired at launch (input route not ready), do it now
+        // while the engine is stopped.
+        if micAuthorized && !inputGraphReady { buildInputGraph() }
 
         // 2. Start engine before connecting new nodes
         if !engine.isRunning {

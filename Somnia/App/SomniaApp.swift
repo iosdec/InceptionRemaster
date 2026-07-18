@@ -12,7 +12,7 @@ struct SomniaApp: App {
 
     init() {
         let engine     = AudioEngine()
-        let det        = EnvironmentDetector()
+        let det        = EnvironmentDetector(audioEngine: engine)   // engine owns the mic
         let controller = SceneController(audioEngine: engine)
 
         _audioEngine     = StateObject(wrappedValue: engine)
@@ -21,6 +21,7 @@ struct SomniaApp: App {
     }
 
     @State private var isReady = AssetStore.shared.isImported
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some Scene {
         WindowGroup {
@@ -34,6 +35,12 @@ struct SomniaApp: App {
                 // No content imported yet — the first-run gate.
                 ImportView(onReady: { isReady = true })
             }
+        }
+        // Dreams run for long stretches without touch — keep the screen awake so it
+        // doesn't dim and auto-lock. Re-asserted on foreground (iOS clears it on
+        // background).
+        .onChange(of: scenePhase) { _, phase in
+            UIApplication.shared.isIdleTimerDisabled = (phase == .active)
         }
     }
 
