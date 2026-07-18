@@ -132,6 +132,8 @@ public class EnvironmentDetector: NSObject, ObservableObject {
     private var lastGeocodedLocation: CLLocation?
     private var lastWeatherLocation: CLLocation?
     private var lastWeatherFetch: Date?
+    /// Set once WeatherKit auth fails — stops the per-fix retry spam for the session.
+    private var weatherUnavailable = false
     private let geocodeMinDistance: CLLocationDistance = 500
     private let weatherMinDistance: CLLocationDistance = 5_000
     private let weatherMinInterval: TimeInterval = 15 * 60
@@ -290,6 +292,12 @@ public class EnvironmentDetector: NSObject, ObservableObject {
 
     private func updateWeather(for location: CLLocation) {
         #if canImport(WeatherKit)
+        // WeatherKit needs the capability on this exact bundle id (a paid-account,
+        // per-App-ID setup). If auth fails, stop trying — it won't recover this run,
+        // and retrying just spams the log and wastes daemon calls. Sunshine dreams
+        // simply won't trigger without it.
+        guard !weatherUnavailable else { return }
+
         // Rate-limit: WeatherKit calls are metered against your account quota.
         if let last = lastWeatherLocation,
            let fetched = lastWeatherFetch,
@@ -313,9 +321,10 @@ public class EnvironmentDetector: NSObject, ObservableObject {
                     self.setMoodNeedsUpdate()
                 }
             } catch {
-                // Most common cause: missing the WeatherKit capability on the App ID.
-                print("⚠️ WeatherKit failed: \(error.localizedDescription)")
-                await MainActor.run { self.lastWeatherFetch = nil }
+                // Almost always the WeatherKit capability missing on this bundle id.
+                // Give up for the session rather than retrying on every fix.
+                print("⚠️ WeatherKit unavailable (needs the WeatherKit capability on \(Bundle.main.bundleIdentifier ?? "this app")'s App ID). Weather-driven dreams disabled. \(error.localizedDescription)")
+                await MainActor.run { self.weatherUnavailable = true }
             }
         }
         #endif
